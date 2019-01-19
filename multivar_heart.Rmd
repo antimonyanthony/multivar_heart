@@ -1,0 +1,616 @@
+---
+title: "Multivariate Regression for Maximum Heart Rate Prediction"
+author: "Anthony DiGiovanni"
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Preprocessing and Exploratory Analysis
+
+Each factor variable is encoded as a factor. Given that `slope` and `fluoro` necessarily take on discrete values that have an order (rather than an arbitrary order of numerical codes), I convert these to ordinal variables.
+
+```{r}
+df = read.table('blob/master/heart.txt', header = TRUE)
+factorvars = c('sex', 'chestpain', 'fbs','restecg','exang','extest')
+ordvars = c('fluoro', 'slope')
+df[,factorvars] = lapply(df[,factorvars], as.factor)
+df[,ordvars] = lapply(df[,ordvars], ordered)
+```
+
+To evaluate the prediction accuracy of the final model, we'll need a test set, so I set aside 20% of the data for this purpose.
+
+```{r}
+set.seed(5)
+
+N = dim(df)[1]
+trainrows = sample(1:N, round(0.8*N))
+
+train = df[trainrows,]
+test = df[-trainrows,]
+```
+
+While no suspicious values are evident in the summary statistics, the distribution of `oldpeak` appears skewed. The histogram for `oldpeak` confirms this observation, showing that about a third of the observations have a value of 0 for this variable. Aside from these zeroes, however, the distribution of oldpeak does not appear to smoothly decline such that a log-like transformation would be appropriate. While the other numeric variables have acceptable distributions, the maximum value of `chol` may be a candidate for an outlier. There are only 2 observations with abnormality 1 for `restecg`, which may preclude meaningful inference for this level of the variable.
+
+```{r}
+summary(train)
+
+numerics = c('age', 'restbp', 'chol', 'oldpeak', 'maxhr')
+
+par(mfrow = c(3, 2))
+for(col in numerics){
+  hist(train[[col]], main=col, xlab='', breaks=50)
+}
+```
+
+Both of the variables with missing values, `fluoro` and `extest`, are non-continuous, meaning that imputation would not be appropriate. Since only 4 out of the 242 observations in the training set are missing any data, it is safe to exclude these observations entirely when computing models that include either of the two variables (the default behavior of `lm`).
+
+```{r}
+noncomplete = !complete.cases(train)
+sum(noncomplete)
+```
+
+The correlation matrix for the numeric columns reveals no evidence of substantial collinearity.
+
+```{r}
+cor(train[,numerics])
+```
+
+Next I check scatterplots of `maxhr` against each continuous variable for evidence of linear and nonlinear trends. To the eye, a meaningful linear relationship is apparent between `age` and `maxhr`, but not for `restbp` or `chol`. While `oldpeak` may have a weakly negative relationship with `maxhr`, this trend is substantially driven by the cluster of points with `oldpeak` equal to 0, which are centered around a relatively large value of `maxhr`. A possible quadratic trend is also evident, as `maxhr` decreases for `oldpeak` less than 2 but tends to increase for values above 2.
+
+```{r}
+par(mfrow = c(2, 2))
+
+for(col in numerics){
+  if(col != 'maxhr'){
+    plot(train[[col]], train[['maxhr']], xlab = col, ylab = 'maxhr')
+  }
+}
+```
+
+Looking at how `maxhr` varies for each level of the different factor variables, we see that `maxhr` is relatively low among observations with `chestpain` in group 4, compared with the other 3 groups that are generally similar. Substantial differences in means are also apparent between the levels of `exang` and `extest`. While `restecg` also shows possible mean differences, the marginal number of observations with `restecg` equal to 1 renders this observation inconclusive. A potentially significant mean decrease from 0 to 1 and from 2 to 3 is apparent for `fluoro`, as well as from 1 to 2 in `slope`.
+
+```{r}
+par(mfrow = c(2, 2))
+
+for(col in factorvars){
+  plot(formula(paste('maxhr', col, sep=' ~ ')), data=train)
+}
+
+par(mfrow = c(2, 2))
+
+for(col in ordvars){
+  plot(formula(paste('maxhr', col, sep=' ~ ')), data=train)
+}
+```
+
+To mathematically check the differences in average `maxhr` for the levels of `chestpain`, `exang`, `extest`, and `restecg`, I apply the Tukey honest significant difference test. This allows us to see confidence intervals for the difference between the mean of `maxhr` among each pair of groups of these factor variables, with corrections for multiple testing that are not overly conservative. (While this test is not technically required for `exang` as opposed to a usual t-test, it is computationally convenient to use the same method here.) At $\alpha = 0.05$ significance, we can conclude that the mean of `maxhr` is lower in group 4 than groups 2 and 3 of `chestpain`; lower for those with exercise-induced angina than without; and higher for those with normal exercise test results than defective. Since `fluoro` and `slope` are ordinal, only consecutive comparisons are required, yet even with the Tukey HSD correction we see a significant decrease in mean from 0 to 1 in `fluoro` and from 1 to 2 in `slope`. No differences are significant for `restecg`, however.
+
+```{r}
+TukeyHSD(aov(maxhr ~ chestpain, train))
+TukeyHSD(aov(maxhr ~ exang, train))
+TukeyHSD(aov(maxhr ~ extest, train))
+TukeyHSD(aov(maxhr ~ restecg, train))
+TukeyHSD(aov(maxhr ~ fluoro, train))
+TukeyHSD(aov(maxhr ~ slope, train))
+```
+
+## Initial Model Candidates
+
+Among the quantitative predictors, `age` showed the most evidence of a linear relationship with `maxhr`. I also include the categorical variables with significant mean differences in this first model. The $R^2$ of this model is not particularly impressive, especially when applied to the validation data, suggesting that a more systematic model selection process including interaction terms may be necessary.
+
+```{r}
+set.seed(5)
+
+n = dim(train)[1]
+valrows = sample(1:n, round(0.5*n))
+
+tr = train[-valrows,]
+val = train[valrows,]
+
+get_rsq = function(model){
+  return(summary(model)$adj.r.squared)
+}
+
+get_valerr = function(model){
+  newx = val[,-13][complete.cases(val[,-13]),]
+  newy = val[,13][complete.cases(val[,-13])]
+  predicted = predict(model, newx)
+  valerror = mean((newy - predicted)^2)
+  return(valerror)
+}
+
+pred_rsq = function(model){
+  newx = val[,-13][complete.cases(val[,-13]),]
+  newy = val[,13][complete.cases(val[,-13])]
+  predicted = predict(model, newx)
+  rsq = 1 - sum((newy - predicted)**2)/sum((newy - mean(newy))**2)
+  p = length(model$coefficients) - 1
+  nmp = model$df.residual
+  return(1 - (1 - rsq)*(nmp+p)/(nmp))
+}
+
+mod = lm(maxhr ~ age + chestpain + exang + extest + fluoro + slope, tr)
+summary(mod)
+get_rsq(mod)
+pred_rsq(mod)
+BIC(mod)
+get_valerr(mod)
+```
+
+I start with forward selection on first-order terms, selecting each additional covariate based on adjusted $R^2$. Since this method involves multiple comparisons, I temporarily split the training set to keep half the points for validation. To compare the models, I plot adjusted $R^2$, BIC, and mean squared validation error each against model size. While the former is maximized in the model with 8 predictors, the optimal BIC among the models selected by the greedy algorithm is achieved at a model of size 2, and validation error also favors a simpler model (size 4).
+
+```{r}
+covars = names(tr)[1:12]
+models = list()
+valerror = rep(0,12)
+selected = c()
+for(j in 1:11){
+  best = covars[1]
+  best_rsq = 0
+  for(newcov in covars){
+    covstring = paste(c(selected, newcov), collapse = ' + ')
+    model = lm(formula(paste('maxhr ~', covstring)), tr)
+    rsq = summary(model)$adj.r.squared
+    if(rsq > best_rsq){
+      best = newcov
+      best_rsq = rsq
+    }
+  }
+  selected = c(selected, best)
+  covstring = paste(selected, collapse = ' + ')
+  models[[j]] = lm(formula(paste('maxhr ~', covstring)), tr)
+  covars = setdiff(covars, best)
+  valerror[j] = get_valerr(models[[j]])
+  print(paste0('Size ', j, ': ', paste('maxhr ~', covstring)))
+}
+
+models[[12]] = lm(maxhr ~ ., tr)
+valerror[12] = get_valerr(models[[12]])
+
+rsq_selected = sapply(models, get_rsq)
+pred_rsq_selected = sapply(models, pred_rsq)
+bics = sapply(models, BIC)
+
+par(mfrow = c(2, 2))
+plot(1:12, rsq_selected, xlab = 'Model Size', ylab = 'Adjusted R^2')
+plot(1:12, pred_rsq_selected, xlab = 'Model Size', ylab = 'Validation Adj R^2')
+plot(1:12, bics, xlab = 'Model Size', ylab = 'BIC')
+plot(1:12, valerror, xlab = 'Model Size', ylab = 'Validation MSE')
+```
+
+To check if a different selection criterion fares better, I repeat forward selection but with validation MSE as the criterion. As expected, this process selects far more generalizable models than the first, with a maximum validation adjusted $R^2$ of about 0.25 and minimum validation MSE under 300. Notably, this algorithm discovers a model that is more complex than the best model from the first algorithm, yet with less validation error. There are tradeoffs with BIC, however$-$given that validation $R^2$ is roughly equal for sizes between 4 and 7, and the decrease in validation error from 4 to 5 is proportionally more substantial than the increase in BIC, I keep the 5-covariate model as the new best candidate.
+
+```{r}
+covars = names(tr)[1:12]
+models = list()
+valerror = rep(0,12)
+selected = c()
+for(j in 1:11){
+  best = covars[1]
+  best_mse = Inf
+  for(newcov in covars){
+    covstring = paste(c(selected, newcov), collapse = ' + ')
+    model = lm(formula(paste('maxhr ~', covstring)), tr)
+    mse = get_valerr(model)
+    if(mse < best_mse){
+      best = newcov
+      best_mse = mse
+    }
+  }
+  selected = c(selected, best)
+  covstring = paste(selected, collapse = ' + ')
+  models[[j]] = lm(formula(paste('maxhr ~', covstring)), tr)
+  covars = setdiff(covars, best)
+  valerror[j] = get_valerr(models[[j]])
+  print(paste0('Size ', j, ': ', paste('maxhr ~', covstring)))
+}
+
+models[[12]] = lm(maxhr ~ ., tr)
+valerror[12] = get_valerr(models[[12]])
+
+rsq_selected = sapply(models, get_rsq)
+pred_rsq_selected = sapply(models, pred_rsq)
+bics = sapply(models, BIC)
+
+par(mfrow = c(2, 2))
+plot(1:12, rsq_selected, xlab = 'Model Size', ylab = 'Adjusted R^2')
+plot(1:12, pred_rsq_selected, xlab = 'Model Size', ylab = 'Validation Adj R^2')
+plot(1:12, bics, xlab = 'Model Size', ylab = 'BIC')
+plot(1:12, valerror, xlab = 'Model Size', ylab = 'Validation MSE')
+```
+
+Before adding interactions, however, some diagnostics and checks for outliers are in order. I plot residuals against fitted values and each quantitative variable, and for each categorical variable I compute the variance of residuals across groups. Considering the distributions of the quantitative variables (e.g. the frequency of observations decreases with the value of `oldpeak`, thus the decrease in spread is not necessarily indicative of lower error variance), there is no substantial evidence of heteroskedasticity. However, the results for `fbs` are possible cause for concern; although far more observations are in group 0 than 1, group 1 has more than twice the residual variance.
+
+```{r}
+sel_mod = lm(maxhr ~ exang + oldpeak + age + chol + restbp, tr)
+
+covs = names(tr)[-13]
+par(mfrow = c(1, 2))
+plot(sel_mod$fitted.values, sel_mod$residuals, xlab='Fitted Values', ylab='Residuals')
+grouping_train = cbind(tr[, covs], sel_mod$residuals)
+for(c in covs){
+  if(c %in% c(factorvars, ordvars)){
+    formstring = paste('sel_mod$residuals ~', c)
+    groupvars = aggregate(formula(formstring), grouping_train, function(x) Var = var(x))
+    print(groupvars)
+  } else {
+    plot(tr[[c]], sel_mod$residuals, xlab=c, ylab='Residuals')
+  }
+}
+```
+
+In light of the difference in variance between levels of `fbs`, I compare the performance of the candidate model with the corresponding weighted least squares models, based on weights defined by this difference. Weighing terms by `fbs` provides a substantial decrease in validation error, and the best adjusted validation $R^2$ so far. Since performance improves even on data other than those from which the weights were derived, we can be relatively confident that there is genuine nonconstant variance between the `fbs` groups, and weighted least squares should be used.
+
+```{r}
+N = dim(df)[1]
+
+var = c(363.95, 874.1421)
+
+var_map = function(x){
+  if(x == '0'){
+    return(1 / (var[1]^2))
+  } else {
+    return(1 / (var[2]^2))
+  }
+}
+
+wts = sapply(df[['fbs']], var_map)
+
+wt_sel_mod = lm(maxhr ~ exang + oldpeak + age + chol + restbp, 
+    data = tr, weights = wts[trainrows][-valrows])
+
+get_rsq(wt_sel_mod)
+pred_rsq(wt_sel_mod)
+BIC(wt_sel_mod)
+get_valerr(wt_sel_mod)
+summary(wt_sel_mod)
+```
+
+Before moving on, I check if a `log(oldpeak + 1)` transformation (which avoids the problem of 0 values) helps improve performance. There is a very slight improvement by every metric.
+
+```{r}
+log_mod = lm(maxhr ~ exang + log1p(oldpeak) + age + chol + restbp, 
+    data = tr, weights = wts[trainrows][-valrows])
+
+get_rsq(log_mod)
+pred_rsq(log_mod)
+BIC(log_mod)
+get_valerr(log_mod)
+summary(log_mod)
+```
+
+The next step is to check for high-leverage points, outliers, and influential points. High-leverage points will have exceptionally high values in the hat matrix and diverge from the trend of the rest of the data in halfnormal plots. There do not appear to be any highly divergent points by this metric.
+
+```{r}
+wt_sel_mod = log_mod
+
+library(faraway)
+
+hatm_sel_mod = influence(wt_sel_mod)$hat
+
+halfnorm(hatm_sel_mod)
+```
+
+Applying a Bonferroni correction to t-tests for the jackknife residuals, we see that only one point in the training set qualifies as an outlier based on this test. This point has an exceptionally low `maxhr` yet lies in group 0 for `exang`, 0 for `restecg`, and 0 for `extest`, none of which are low-mean groups based on the earlier analysis.
+
+```{r}
+jack = rstudent(wt_sel_mod)
+bonf = qt(0.05/((dim(tr)[1] - 1)*2), wt_sel_mod$df.residual) # removing missing value in calculation of n
+
+which(abs(jack) > abs(bonf))
+```
+
+```{r}
+tr['246',]
+```
+
+Finally, I check for influential points. The one unambiguous deviation is the same outlier point `246`.
+
+```{r}
+cook = cooks.distance(wt_sel_mod)
+halfnorm(cook)
+```
+
+```{r}
+cook[c(68)]
+```
+
+These results justify the use of some robust regression methods, but first, I test combinations of interaction terms.
+
+## Interactions
+
+I start by including every two-way interaction term possible with between the covariates of the two models under consideration. The stark decrease in performance shows that degrees of freedom are likely being wasted on unnecessary terms, so I proceed to run ANOVA on this new model.
+
+```{r}
+int_mod = lm(maxhr ~ (exang + log1p(oldpeak) + age + chol + restbp)^2, data = tr, weights = wts[trainrows][-valrows])
+
+ftest = function(full, reduced){
+  RSS_full = sum(full$residuals^2)
+  RSS_red = sum(reduced$residuals^2)
+  nmp = full$df.residual
+  k = reduced$df.residual - nmp
+  Fstat = (RSS_red-RSS_full)/(k) / (RSS_full/nmp)
+  pval = 1 - pf(Fstat,k,nmp)
+  return(pval)
+}
+
+get_rsq(int_mod)
+pred_rsq(int_mod)
+get_valerr(int_mod)
+BIC(int_mod)
+ftest(int_mod, wt_sel_mod)
+```
+
+Age evidently interacts with many variables, however the `exang` and `fluoro` interactions do not seem to be worth including.
+
+```{r}
+anova(int_mod)
+```
+
+Although excluding interactions involving `chol` and `oldpeak` increases performance, it's still worse than the model without any interactions, and based on the F tests we would not reject the null hypothesis that the coefficients of all interaction terms between these 5 covariates are 0.
+
+```{r}
+ear_mod = lm(maxhr ~ (exang + age + restbp)^2 + chol + log1p(oldpeak), data = tr, weights = wts[trainrows][-valrows])
+
+get_rsq(ear_mod)
+pred_rsq(ear_mod)
+get_valerr(ear_mod)
+BIC(ear_mod)
+ftest(ear_mod, wt_sel_mod)
+anova(ear_mod)
+```
+
+To look for useful interaction terms more systematically, I apply forward selection to the 2-way and 3-way interaction terms of all the covariates in this best model so far. None of the steps, however, succeeds at increasing validation accuracy.
+
+```{r warning=FALSE}
+selected = c('exang', 'log1p(oldpeak)', 'age', 'chol', 'restbp')
+N = length(selected)
+inter = c()
+for(i in 1:(N-1)){
+  for(j in (i+1):N){
+    inter = c(inter, paste(selected[i],selected[j],sep=":"))
+  }
+}
+
+for(i in 1:(N-2)){
+  for(j in (i+1):(N-1)){
+    for(k in (j+1):N)
+      inter = c(inter, paste(selected[i],selected[j],selected[k],sep=":"))
+  }
+}
+
+M = length(inter)
+
+models = list()
+valerror = rep(0,M)
+for(j in 1:(M-1)){
+  best = inter[1]
+  best_mse = Inf
+  for(newcov in inter){
+    covstring = paste(c(selected, newcov), collapse = ' + ')
+    model = lm(formula(paste('maxhr ~', covstring)), data=tr, weights=wts[trainrows][-valrows])
+    mse = get_valerr(model)
+    if(mse < best_mse){
+      best = newcov
+      best_mse = mse
+    }
+  }
+  inter = setdiff(inter, best)
+  selected = c(selected, best)
+  covstring = paste(selected, collapse = ' + ')
+  models[[j]] = lm(formula(paste('maxhr ~', covstring)), tr)
+  valerror[j] = get_valerr(models[[j]])
+}
+
+models[[M]] = lm(maxhr ~ (exang + oldpeak + age + chol + restbp)^3, tr)
+valerror[M] = get_valerr(models[[M]])
+
+rsq_selected = sapply(models, get_rsq)
+pred_rsq_selected = sapply(models, pred_rsq)
+bics = sapply(models, BIC)
+
+par(mfrow = c(2, 2))
+plot(1:M, rsq_selected, xlab = 'Number of Interactions', ylab = 'Adjusted R^2')
+plot(1:M, pred_rsq_selected, xlab = 'Number of Interactions', ylab = 'Validation Adj R^2')
+plot(1:M, bics, xlab = 'Number of Interactions', ylab = 'BIC')
+plot(1:M, valerror, xlab = 'Number of Interactions', ylab = 'log10(Validation MSE)')
+```
+
+To check that the interaction selection algorithm has not missed some important terms due to the greedy selection, I try removing insignificant interactions in batches from the largest 2-way model possible (within degrees of freedom constraints) until performance stops improving. By the time the trimmed model plateaus, however, its validation adjusted $R^2$ is still negative. The contrast between high adjusted $R^2$ on the training data and these negative validation results shows the extreme degree to which these complex models can overfit.
+ 
+```{r}
+full_mod = lm(maxhr ~ (. - chol - oldpeak)^2 + chol + log1p(oldpeak), data = tr, weights = wts[trainrows][-valrows])
+
+get_rsq(full_mod)
+pred_rsq(full_mod)
+get_valerr(full_mod)
+BIC(full_mod)
+anova(full_mod)
+```
+
+```{r}
+trim_mod = lm(maxhr ~ (. - chol - oldpeak)^2 + chol + log1p(oldpeak) - exang:fluoro - fbs:restecg - restbp:exang - sex:fluoro - sex:slope - sex:restbp - age:exang, data = tr, weights = wts[trainrows][-valrows])
+
+get_rsq(trim_mod)
+pred_rsq(trim_mod)
+get_valerr(trim_mod)
+BIC(trim_mod)
+anova(trim_mod)
+```
+
+```{r}
+trim_mod2 = lm(maxhr ~ (. - chol - oldpeak)^2 + chol + log1p(oldpeak) - exang:fluoro - fbs:restecg - restbp:exang - sex:fluoro - sex:slope - sex:restbp - age:exang - restecg:fluoro - fluoro:extest - restecg:exang - restbp:slope - chestpain:restecg - chestpain:fbs - chestpain:restbp - sex:exang - age:slope - age:fbs, data = tr, weights = wts[trainrows][-valrows])
+
+get_rsq(trim_mod2)
+pred_rsq(trim_mod2)
+get_valerr(trim_mod2)
+BIC(trim_mod2)
+anova(trim_mod2)
+```
+
+```{r}
+trim_mod3 = lm(maxhr ~ (. - chol - oldpeak)^2 + chol + log1p(oldpeak) - exang:fluoro - fbs:restecg - restbp:exang - sex:fluoro - sex:slope - sex:restbp - age:exang - restecg:fluoro - fluoro:extest - restecg:exang - restbp:slope - chestpain:restecg - chestpain:fbs - chestpain:restbp - sex:exang - age:slope - age:fbs - slope:extest - slope:fluoro - fbs:fluoro - fbs:slope - chestpain:fluoro - chestpain:slope - chestpain:exang - age:restbp, data = tr, weights = wts[trainrows][-valrows])
+
+get_rsq(trim_mod3)
+pred_rsq(trim_mod3)
+get_valerr(trim_mod3)
+BIC(trim_mod3)
+anova(trim_mod3)
+```
+
+```{r}
+trim_mod4 = lm(maxhr ~ (. - chol - oldpeak)^2 + chol + log1p(oldpeak) - exang:fluoro - fbs:restecg - restbp:exang - sex:fluoro - sex:slope - sex:restbp - age:exang - restecg:fluoro - fluoro:extest - restecg:exang - restbp:slope - chestpain:restecg - chestpain:fbs - chestpain:restbp - sex:exang - age:slope - age:fbs - slope:extest - slope:fluoro - fbs:fluoro - fbs:slope - chestpain:fluoro - chestpain:slope - chestpain:exang - age:restbp - exang:extest - exang:slope - restecg:slope - fbs:extest - chestpain:extest, data = tr, weights = wts[trainrows][-valrows])
+
+get_rsq(trim_mod4)
+pred_rsq(trim_mod4)
+get_valerr(trim_mod4)
+BIC(trim_mod4)
+anova(trim_mod4)
+```
+
+```{r}
+trim_mod5 = lm(maxhr ~ (. - chol - oldpeak)^2 + chol + log1p(oldpeak) - exang:fluoro - fbs:restecg - restbp:exang - sex:fluoro - sex:slope - sex:restbp - age:exang - restecg:fluoro - fluoro:extest - restecg:exang - restbp:slope - chestpain:restecg - chestpain:fbs - chestpain:restbp - sex:exang - age:slope - age:fbs - slope:extest - slope:fluoro - fbs:fluoro - fbs:slope - chestpain:fluoro - chestpain:slope - chestpain:exang - age:restbp - exang:extest - exang:slope - restecg:slope - fbs:extest - chestpain:extest - fbs:exang - age:restecg - age:chestpain - age:extest - sex:chestpain, data = tr, weights = wts[trainrows][-valrows])
+
+get_rsq(trim_mod5)
+pred_rsq(trim_mod5)
+get_valerr(trim_mod5)
+BIC(trim_mod5)
+anova(trim_mod5)
+```
+
+## Regularization
+
+Although the above analysis did not succeed at revealing useful interactions, the Lasso method might help as an alternative source of automated model selection, in addition to increasing robustness to the outliers, high-leverage points, and influential points discussed above. After ensuring that the continuous covariates have mean 0 and the norm of each column is 1, I fit Lasso regression models (with all 2-way interaction terms except those for `chol` and `oldpeak` due to degrees of freedom limitations) across a range of $\lambda$ parameters to determine which L1-norm penalty term ensures the minimal validation error. 
+
+```{r}
+library(glmnet)
+
+n = dim(train)[1]
+center = function(col) {col - mean(col)}
+rescale = function(col) {col*sqrt(1/sum(col**2))}
+
+numcovars = setdiff(numerics, 'maxhr')
+
+std_train = train
+std_train[,numcovars] = data.frame(apply(std_train[,numcovars], 2, center))
+std_train[,numcovars] = data.frame(apply(std_train[,numcovars], 2, rescale))
+
+std_tr = std_train[-valrows,]
+std_val = std_train[valrows,]
+
+X = model.matrix(~ (age + sex + chestpain + restbp + fbs + restecg
+                    + exang + slope + fluoro + extest)^2 + chol + log1p(oldpeak), data=std_tr)
+newx = model.matrix(~ (age + sex + chestpain + restbp + fbs + restecg
+                    + exang + slope + fluoro + extest)^2 + chol + log1p(oldpeak), data=std_val)
+
+regularize = function(X, newx, alpha, maxlam){
+  lam = seq(0,maxlam,0.1)
+  valerr = rep(0,length(lam))
+  if(dim(X)[1] == sum(complete.cases(std_tr))){
+    y = std_tr[['maxhr']][complete.cases(std_tr)]
+  } else {
+    y = std_tr[['maxhr']]
+  }
+  for(i in 1:length(lam)){
+    if(dim(X)[1] == sum(complete.cases(std_tr))){
+      model = glmnet(X, y, lambda=lam[i], alpha=alpha, weights=wts[trainrows][-valrows][complete.cases(std_tr)], maxit = 1000000)
+    } else {
+      model = glmnet(X, y, lambda=lam[i], alpha=alpha, weights=wts[trainrows][-valrows], maxit = 1000000)
+    }
+    pred = predict(model, newx)
+    if(dim(X)[1] == sum(complete.cases(std_tr))){
+      newy = std_val[,13][complete.cases(std_val)]
+    } else {
+      newy = std_val[,13]
+    }
+    err = mean((pred - newy)**2)
+    valerr[i] = err
+  }
+  plot(lam, valerr)
+  print(min(valerr))
+  if(dim(X)[1] == sum(complete.cases(std_tr))){
+    rid_mod = glmnet(X, y, lambda=lam[which.min(valerr)], alpha=alpha, weights=wts[trainrows][-valrows][complete.cases(std_tr)], maxit = 1000000)
+  } else {
+    rid_mod = glmnet(X, y, lambda=lam[which.min(valerr)], alpha=alpha, weights=wts[trainrows][-valrows], maxit=1000000)
+  }
+
+  print(rid_mod$beta)
+  print(min(valerr))
+}
+
+regularize(X, newx, 1, 10)
+```
+
+The Lasso-selected model does not surpass the current candidate, but it does come close in terms of validation error. Using the nonzero coefficients, I build another interaction model, including any lower-order terms even if their coefficients in Lasso were 0. However, this is also not an improvement.
+
+```{r}
+lasso_mod = lm(formula = maxhr ~ age + (sex+chestpain+slope)^2 + restecg*extest + fluoro*restbp + log1p(oldpeak), data = tr, weights = wts[trainrows][-valrows])
+
+get_rsq(lasso_mod)
+pred_rsq(lasso_mod)
+get_valerr(lasso_mod)
+BIC(lasso_mod)
+```
+
+In case the outliers and influential points may be causing problems for the best model, I test regularization parameters for the Ridge regression method as well, in order to ensure robust regression without necessarily setting coefficients to 0. A very small value of $\lambda$ helps, but not significantly.
+
+```{r}
+X = model.matrix(~ exang + oldpeak + age + chol + restbp, data=std_tr)
+newx = model.matrix(~ exang + oldpeak + age + chol + restbp, data=std_val)
+
+regularize(X, newx, 0, 10)
+```
+
+## Conclusions and Prediction Accuracy
+
+After this analysis, it is apparent that linear models have significant limitations on this dataset. I compare the test set performance of the best model, the model I initially selected based on the scatterplots and boxplots of individual covariates, and a near-full 2-way interaction model (all weighted as before)$-$each fitted to the whole training set. We see that although the more complex models have greater adjusted $R^2$ on the training data, they fail to generalize and maintain low error on the test set, as the model selected for generalizability does.
+
+```{r}
+best = lm(maxhr ~ exang + log1p(oldpeak) + age + chol + restbp, data=train, weights=wts[trainrows])
+
+initial = lm(maxhr ~ age + chestpain + exang + extest + fluoro + slope, data=train, weights=wts[trainrows])
+
+full = lm(maxhr ~ (. - chol - oldpeak)^2 + chol + log1p(oldpeak), data = train, weights = wts[trainrows])
+
+test_rsq = function(model){
+  newx = test[,-13][complete.cases(test[,-13]),]
+  newy = test[,13][complete.cases(test[,-13])]
+  predicted = predict(model, newx)
+  rsq = 1 - sum((newy - predicted)**2)/sum((newy - mean(newy))**2)
+  p = length(model$coefficients) - 1
+  nmp = model$df.residual
+  return(1 - (1 - rsq)*(nmp+p)/(nmp))
+}
+
+testerr = function(model){
+  newx = test[,-13][complete.cases(test[,-13]),]
+  newy = test[,13][complete.cases(test[,-13])]
+  predicted = predict(model, newx)
+  testerror = mean((newy - predicted)^2)
+  return(testerror)
+}
+
+get_rsq(best)
+test_rsq(best)
+testerr(best)
+get_rsq(initial)
+test_rsq(initial)
+testerr(initial)
+get_rsq(full)
+test_rsq(full)
+testerr(full)
+```
+
+The best model in terms of prediction accuracy also has the virtue of interpretability. From the coefficients, it is evident that the average maximum heart rate among patients with exercise-induced angina is estimated to be about 14 bpm less (approximately 10% of the mean) than that of those without. With each factor of e by which the severity of the change in ECG represented by `oldpeak` is multiplied (after a constant transformation), maximum heart rate declines$-$specifically an amount that is roughly $\frac{1}{12}$ of the mean value of `maxhr`. Each year of patient age contributes about a 0.8 bpm decrease, and while the relationships between cholesterol and resting blood pressure cannot be confidently known to be nonzero in light of the large number of tests conducted in this analysis, maximum heart rate mildly increases with each of these factors.
+
+```{r}
+mean(df$maxhr)
+summary(best)
+```
